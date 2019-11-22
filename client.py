@@ -5,7 +5,7 @@ import time
 import random
 
 NUMBER_OF_FILES_PER_REQUEST = 10
-INTERVAL = 5
+INTERVAL = 1
 
 
 class Client():
@@ -32,6 +32,8 @@ class Client():
                 msg = json.dumps(files_array).encode()
                 sock.sendall(msg)
                 time.sleep(INTERVAL)
+        except:
+            self.logger.info("connection with the server is ended")
         finally:
             sock.close()
 

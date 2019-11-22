@@ -1,9 +1,12 @@
 from Utils import logger, flow_parser
 import socket
-import parser
 import json
 import psycopg2
-
+import queue
+from threading import Thread
+from Utils.timeout import Timeout
+from datetime import datetime
+import time
 
 class Server():
     def __init__(self, address, port, db_host, db_name, db_usr, db_pass):
@@ -13,35 +16,68 @@ class Server():
         self.db_name = db_name
         self.db_usr = db_usr
         self.db_pass = db_pass
+        self.requests_queue = queue.Queue()
+        self.current_number_of_requests = 0
         self.logger = logger.get_logger(__name__)
 
     def run(self):
-        sock = self.create_sock_connection()
-        db_cur, db_con = self.create_db_connection()
+        self.sock = self.create_sock_connection()
+        self.db_cur, self.db_con = self.create_db_connection()
+
+        # create thread to handle the requests queue
+        Thread(target=self.requests_handler).start()
+
+        # create thread to handle the heartbeat
+        Thread(target=self.heartbeat_handler).start()
 
         while True:
             # Wait for a connection
+            # we allowed multiple connections but the server can handle up to 4 requests simultaneously
             self.logger.info('waiting for a connection')
-            connection, client_address = sock.accept()
-            try:
-                self.logger.info('connection from ' + str(client_address))
+            connection, client_address = self.sock.accept()
+            self.logger.info('connection from ' + str(client_address))
+            Thread(target=self.receive_from_connection, args=(connection, client_address,)).start()
 
-                # Receive the data in small chunks and retransmit it
-                while True:
-                    data = connection.recv(512).decode()
+        # Clean up the connection
+        self.db_cur.close()
+        self.db_con.close()
 
-                    if data:
-                        files_array = json.loads(data)
-                        for file in files_array:
-                            self.logger.info('received file {file} with status {status}'.
-                                             format(file=file, status=str(files_array[file])))
-                            db_cur.execute("INSERT INTO files_reader Values ('{name}', '{status}');".format(name=file, status=files_array[file]))
-                            db_con.commit()
+    def receive_from_connection(self, con, address):
+        try:
+            while True:
+                data = con.recv(4096).decode()
+                self.logger.info("data: " + str(data))
+                self.requests_queue.put(data)
+        except:
+            self.logger.info("connection from {add} is end".format(add=address))
 
-            finally:
-                # Clean up the connection
-                db_cur.close()
-                db_con.close()
+    def requests_handler(self):
+        while True:
+            if self.current_number_of_requests < 4 and not self.requests_queue.empty():
+                self.current_number_of_requests += 1
+                data = self.requests_queue.get()
+                Thread(target=self.analyze_data, args=(data,)).start()
+
+    @Timeout(40)
+    def analyze_data(self, data):
+        files_array = json.loads(data)
+        for file in files_array:
+            if files_array[file] == "not-corrupt":
+                self.logger.info('received file {file}'.format(file=file))
+                self.db_cur.execute("INSERT INTO files_reader Values ('{type}', '{name}');".format(type="file", name=file))
+                self.db_con.commit()
+            else:
+                self.logger.warning('file {file} is corrupted!'.format(file=file))
+        self.current_number_of_requests -= 1
+
+    def heartbeat_handler(self):
+        while True:
+            # current date and time
+            now = datetime.now()
+            self.db_cur.execute("INSERT INTO files_reader Values ('{type}', '{name}');".format(type="heartbeat", name=now))
+            self.db_con.commit()
+
+            time.sleep(60)
 
     def create_sock_connection(self):
         # Create a TCP/IP socket
